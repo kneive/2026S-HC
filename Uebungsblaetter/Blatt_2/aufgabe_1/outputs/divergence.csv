@@ -1,0 +1,20 @@
+# n=16777216 iters=4096 warpSize=32
+stride,gflops,ms,regime
+1,5778.339,13.37918,divergent
+2,5821.985,13.27887,divergent
+4,5912.791,13.07494,divergent
+8,5739.027,13.47082,divergent
+16,6015.687,12.85130,divergent
+32,11263.572,6.86367,divergenzfrei
+33,6170.060,12.52977,teilweise divergent
+34,6383.890,12.11008,teilweise divergent
+36,6620.378,11.67749,teilweise divergent
+40,7333.518,10.54193,teilweise divergent
+48,8525.249,9.06829,teilweise divergent
+64,11064.900,6.98691,divergenzfrei
+65,7510.691,10.29325,teilweise divergent
+66,7731.634,9.99910,teilweise divergent
+68,7901.234,9.78447,teilweise divergent
+72,8314.745,9.29787,teilweise divergent
+80,9038.961,8.55291,teilweise divergent
+96,10684.385,7.23574,divergenzfrei

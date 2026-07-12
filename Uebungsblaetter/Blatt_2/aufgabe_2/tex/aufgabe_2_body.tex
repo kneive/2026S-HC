@@ -1,0 +1,227 @@
+
+\section{Aufgabe 2}
+
+Die Messungen wurden auf einer NVIDIA GeForce RTX 4060 durchgeführt. Laut
+Geräteabfrage liegt die theoretische Speicherbandbreite bei
+272 GB/s. Die GPU besitzt 24 SMs und maximal 1536 Threads pro SM, also
+48 Warps pro SM.
+
+\subsection{Speicherintensiver Kernel}
+
+Ein speicherintensiver Kernel wurde in \texttt{memory.cu} implementiert. Jeder Thread 
+liest einen Wert aus \texttt{a} multipliziert diesen mit einer Konstanten \texttt{c}
+und schreibt diesen Wert nach \texttt{b}. 
+
+\begin{verbatim}
+b[i] = a[i] * c;
+\end{verbatim}
+
+Während der Rechenaufwand pro Element mit höchstens 0{,}25 FLOP/Byte sehr gering ist, 
+entstehen Speicherzugriffe im Umfang von 8 Byte durch einen 4 Byte \textit{read} und 
+einen 4 Byte \textit{write}. Damit wird die Laufzeit des Kernels primär durch das 
+Speicherzugriffsmuster und nicht die ALUs bestimmt.
+
+
+Es wurden insgesamt drei Varianten des Kernels implementiert:
+
+\begin{itemize}
+  \item \texttt{kernel\_copy\_coalesced}: benachbarte Threads lesen
+        benachbarte Adressen.
+  \item \texttt{kernel\_copy\_strided}: Thread \texttt{i} liest
+        \texttt{a[(i * stride) \% n]}.
+  \item \texttt{kernel\_copy\_gather}: Thread \texttt{i} liest eine
+        zufällige Adresse \texttt{a[idx[i]]}.
+\end{itemize}
+
+\subsubsection{STREAM-Triad als Referenzfall}
+
+Zusätzlich wurde ein STREAM-Kernel in \texttt{stream.cu} als Referenz implementiert. 
+Dieser bearbeitet ein klassisches Bandbreitenproblem:
+%Der STREAM-Kernel ist deshalb ein sehr guter Referenzfall
+%für ideale, zusammenhängende und coalesced Speicherbandbreite.
+
+\begin{verbatim}
+a[i] = b[i] + alpha * c[i];
+\end{verbatim}
+
+Pro Element werden zwei Werte \texttt{b[i]} und \texttt{c[i]} gelesen und ein Wert 
+\texttt{a[i]} geschrieben. Das erzeugt bei FP32 Speicherzugriffe im Umfang von 12 Bytes 
+für nur eine \textit{fused multiply add (fma)}. Diese hat einen arithmetischen Aufwand von  
+etwa 0{,}17 FLOP/Byte.
+
+Der Unterschied zu \texttt{memory.cu} besteht darin, dass
+
+\begin{itemize}
+  \item \texttt{stream.cu} einen einzelnen, gutartigen
+        STREAM-Triad-Fall misst. Bei dem alle Threads regulär und zusammenhängend
+        auf \texttt{a}, \texttt{b} und \texttt{c} zugreifen. Der Kernel beantwortet damit die Frage:
+        Welche Bandbreite ist bei einem sauberen Streaming-Zugriff erreichbar?
+  \item \texttt{memory.cu} variiert dagegen gezielt das Zugriffsmuster. Derselbe
+        einfache Rechenkern wird als \textit{coalesced}, \textit{strided} und 
+        \textit{random gather} ausgeführt. Damit beantwortet der Kernel die Frage:
+        Wie stark bricht die Bandbreite ein, wenn die Adressen innerhalb einer Warps ungünstig liegen?
+\end{itemize}
+
+\subsubsection{Zugriffsmuster und effektive Bandbreite}
+
+Für den Sweep wurden $33\,554\,432$ Elemente verwendet. Die
+Messwerte liegen in \texttt{patterns.csv}; die daraus erzeugte Grafik ist in
+Abbildung~\ref{fig:patterns} dargestellt.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth]{patterns.png}
+  \caption{Effektive Bandbreite für coalesced, strided und Gather-Zugriffe.}
+  \label{fig:patterns}
+\end{figure}
+
+\begin{table}[H]
+  \centering
+  \begin{tabular}{p{4.2cm}
+                  >{\raggedleft\arraybackslash}p{2.5cm}
+                  >{\raggedleft\arraybackslash}p{3.0cm}
+                  >{\raggedleft\arraybackslash}p{2.5cm}}
+    \hline
+    \textbf{Muster} & \textbf{Stride} & \textbf{GB/s} & \textbf{\% Peak} \\
+    \hline
+    coalesced & 1   & 251{,}30 & 92{,}38 \\
+    strided   & 2   & 169{,}15 & 62{,}18 \\
+    strided   & 4   & 101{,}76 & 37{,}41 \\
+    strided   & 8   & 56{,}34  & 20{,}71 \\
+    strided   & 16  & 56{,}31  & 20{,}70 \\
+    strided   & 32  & 56{,}30  & 20{,}70 \\
+    strided   & 64  & 51{,}69  & 19{,}00 \\
+    strided   & 128 & 40{,}87  & 15{,}02 \\
+    random gather & - & 28{,}03 & 10{,}30 \\
+    \hline
+  \end{tabular}
+  \caption{Gemessene effektive Bandbreite für verschiedene Zugriffsmuster.}
+  \label{tab:patterns}
+\end{table}
+
+Der \textit{coalesced} Fall (\textit{stride}$=1$) erreicht mit $251{,}30$ GB/s 
+etwa $92$ Prozent des theoretischen Peaks. Das ist der Idealfall für eine GPU: 
+Alle $32$ Lanes eines Warps lesen zusammenhängende Adressen, sodass die Hardware 
+wenige große Speichertransaktionen bilden kann. Damit ist fast jedes übertragene 
+Byte nutzbar.
+
+Bei \textit{strided} Zugriffen (\textit{stride}$>1$) sinkt die nutzbare Bandbreite 
+dagegen deutlich. Schon bei einem \textit{stride} von $2$ fällt die nutzbare Bandbreite
+auf $169{,}15$ GB/s und für einen \textit{stride} von $4$ auf $101{,}76$ GB/s. 
+Ab einem \textit{stride} von $8$ werden nur noch etwa $20$ Prozent des Peaks 
+($\approx50$ GB/s) erreicht. Das liegt daran, dass mit zunehmendem \textit{stride} die 
+Lanes eines Warps weiter auseinanderliegende Adressen lesen müssen. Dadurch müssen 
+mehr Speichersegmente geladen werden, obwohl pro Segment nur ein kleiner Teil
+tatsächlich genutzt wird.
+
+\textit{Random Gather} hat mit $28{,}03$ GB/s die geringste nutzbare Bandbreite. 
+Jede Lane liest praktisch eine zufällige Adresse, wodurch \textit{coalescing} und 
+\textit{räumliche Lokalität} fast vollständig verloren gehen. Viele einzelne 
+Speichertransaktionen und Cache-Misses senken dabei die effektive Bandbreite auf 
+etwa $10$ Prozent des Peaks.
+
+\section{\textit{Occupancy} und \textit{latency hiding}}
+
+Im zweiten Experiment wurde die Blockgröße des \textit{coalesced} Kernels variiert. 
+Für jede Blockgröße wurde die theoretische \textit{occupancy} mit
+\texttt{cudaOccupancyMaxActiveBlocksPerMultiprocessor()} bestimmt:
+
+\[
+\mathrm{Occupancy}
+= \frac{\mbox{aktive Warps}}{\mbox{maximal mögliche aktive Warps}}.
+\]
+
+Die Messwerte liegen in \texttt{outputs/occupancy.csv}; die Grafik ist in
+Abbildung~\ref{fig:occupancy} dargestellt.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth]{occupancy.png}
+  \caption{Zusammenhang zwischen Blockgröße, \textit{Occupancy} und Bandbreite.}
+  \label{fig:occupancy}
+\end{figure}
+
+\begin{table}[H]
+  \centering
+  \begin{tabular}{>{\raggedleft\arraybackslash}p{3.0cm}
+                  >{\raggedleft\arraybackslash}p{3.0cm}
+                  >{\raggedleft\arraybackslash}p{3.0cm}
+                  >{\raggedleft\arraybackslash}p{2.5cm}}
+    \hline
+    \textbf{Blockgröße} & \textbf{Occupancy} & \textbf{GB/s} & \textbf{\% Peak} \\
+    \hline
+    32   & 0{,}500 & 183{,}24 & 67{,}36 \\
+    64   & 1{,}000 & 251{,}30 & 92{,}38 \\
+    128  & 1{,}000 & 251{,}32 & 92{,}39 \\
+    256  & 1{,}000 & 251{,}33 & 92{,}39 \\
+    512  & 1{,}000 & 251{,}30 & 92{,}38 \\
+    1024 & 0{,}667 & 239{,}14 & 87{,}91 \\
+    \hline
+  \end{tabular}
+  \caption{\textit{Occupancy-Sweep} für den \textit{coalesced} Kernel.}
+  \label{tab:occupancy}
+\end{table}
+
+Bei einer Blockgröße von $32$ liegt die \textit{occupancy} nur bei $50$\% und die 
+Bandbreite fällt auf $183{,}24$ GB/s. Das heißt, es sind zu wenige Warps in einem 
+\textit{Streaming Multiprocessor (SM)}, um Speicher-Stalls vollständig zu überdecken. 
+Ab einer Blockgröße von $64$ erreicht die  \textit{occupancy} stabil fast $100$\%. 
+Die Bandbreite steigt dann auf $\approx251$ GB/s und bleibt bis zu einer Blockgröße von 
+$512$ stabil. Ab einer Blockgröße von $1024$ sinkt die \textit{occupancy} wieder auf 
+$\approx66,7$\%, da sich insgesamt weniger große Blöcke gleichzeitig auf einem 
+\textit{Streaming Multiprocessor} befinden können; die
+Bandbreite sinkt dadurch auf $239{,}14$ GB/s.
+
+Das Experiment zeigt sog. \textit{latency hiding}: Da ein einzelner
+Speicherzugriff mehrere Zyklen dauern kann, kann der \textit{Warp-Scheduler} bei einem 
+\textit{stall} während der Verarbeitung eines Warps auf einen anderen Warp wechseln, 
+solange sich genügend lauffähige Warps im \textit{Streaming Multiprocessor} befinden. Dadurch 
+wird die Speicherlatenz eines einzelnen Warps zwar nicht vermieden, aber durch 
+Parallelität überdeckt.
+
+\subsection{GPU- und CPU-Strategien im Vergleich}
+
+Die GPU vermeidet lange Speicherlatenzen durch einen hohen Durchsatz, indem sich viele 
+Warps gleichzeitig in den \textit{SMs} befinden und Warp-Scheduling genutzt wird, um 
+lange Speicherlatenzen zu maskieren.
+Wie Experimente zu den Zugriffsmustern \textit{strided} und \textit{random gather} zeigen, 
+sind GPU Caches im Vergleich zu CPU-Caches klein und können zufällige Zugriffe nicht in 
+gleichem Umfang  abfedern. Deshalb entscheidet das Zugriffsmuster direkt über die 
+erreichte Bandbreite.
+
+Die CPU ist dagegen auf eine niedrige Latenz einzelner Instruktionsströme
+optimiert. Sie nutzt hierfür mehrstufige Cache-Hierarchien, Hardware-Prefetching,
+Out-of-Order-Execution und wenige starke Kerne. Sequenzielle Zugriffe
+können dadurch sehr schnell sein, weil Daten rechtzeitig in den Cache geladen
+werden. Falls zufällige Zugriffe Cache-Misses verursachen, sind diese auch für die CPU 
+teuer.
+
+\subsection{Folgen für das Datenlayout und GPU-Programme}
+
+Aus den Messungen ergeben sich die folgenden Konsequenzen für effiziente
+GPU-Programme:
+
+\begin{itemize}
+  \item Benachbarte Threads sollten benachbarte Speicheradressen lesen oder
+        schreiben.
+  \item Eine \textit{Structure-of-Arrays} ist für viele GPU-Zugriffsmuster günstiger als
+        ein \textit{Array-of-Structures}, weil Felder dann zusammenhängend gelesen werden.
+  \item \textit{Random Gather} und \textit{Scatter} sollten vermieden oder durch vorheriges
+        Sortieren bzw. Umordnen der Daten reduziert werden.
+  \item Daten sollten passend ausgerichtet und bei 2D-Strukturen gegebenenfalls
+        gepaddet werden.
+  \item Es müssen genug Threads bereitgestellt und passende Blockgrößen gewählt werden,
+        damit sich immer genügend lauffähige Warps gleichzeitig in den SMs befinden können.
+\end{itemize}
+
+%\begin{verbatim}
+%make
+%make all
+%make patterns
+%make occupancy
+%make stream
+%make memory
+%make report
+%./build/bench mem 33554432 8 30
+%./build/bench stream 67108864 20
+%\end{verbatim}

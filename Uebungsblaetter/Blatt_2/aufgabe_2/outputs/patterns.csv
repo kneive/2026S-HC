@@ -1,0 +1,11 @@
+# n=33554432 peak_gbs=272.032
+pattern,stride,gbs,pct_peak
+coalesced,1,251.30,92.38
+strided,2,169.15,62.18
+strided,4,101.76,37.41
+strided,8,56.34,20.71
+strided,16,56.31,20.70
+strided,32,56.30,20.70
+strided,64,51.69,19.00
+strided,128,40.87,15.02
+gather,0,28.03,10.30

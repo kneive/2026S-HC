@@ -1,0 +1,29 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[ngerman]{babel}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{array}
+\usepackage{pdfpages}
+
+\geometry{margin=2.5cm}
+\graphicspath{{../aufgabe_1/outputs/}{../aufgabe_2/outputs/}}
+\setlength{\emergencystretch}{2em}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=black
+}
+
+\begin{document}
+\includepdf[pages=1,pagecommand={}]{../../2026S_Ubung_HC02.pdf}
+
+\input{../aufgabe_1/tex/aufgabe_1_body.tex}
+\clearpage
+\input{../aufgabe_2/tex/aufgabe_2_body.tex}
+
+\end{document}
