@@ -1,0 +1,2 @@
+source /home/woodstock/projects/pi_coding/sensor_array/master/build_alt/gdbinit/symbols
+source /home/woodstock/projects/pi_coding/sensor_array/master/build_alt/gdbinit/connect

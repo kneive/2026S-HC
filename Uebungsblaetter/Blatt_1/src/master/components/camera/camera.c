@@ -1,8 +1,6 @@
 #include "camera.h"
 
 #include <stdbool.h>
-#include <stdlib.h>
-#include <string.h>
 #include "driver/gpio.h"
 #include "driver/i2c_types.h"
 #include "esp_camera.h"
@@ -11,7 +9,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "receiver_i2c_bus.h"
 
 static const char *TAG = "CAMERA";
 
@@ -42,32 +39,6 @@ static const char *TAG = "CAMERA";
 
 static bool camera_driver_initialized = false;
 static SemaphoreHandle_t camera_frame_lock = NULL;
-static SemaphoreHandle_t camera_targets_lock = NULL;
-static camera_target_t camera_targets[CAMERA_MAX_TARGETS];
-static size_t camera_target_count = 0;
-
-typedef struct {
-  uint8_t mac[6];
-  int rssi[RECEIVER_I2C_BUS_ANTENNA_COUNT];
-  bool seen[RECEIVER_I2C_BUS_ANTENNA_COUNT];
-  int best_rssi;
-} target_candidate_t;
-
-static const int antenna_x[RECEIVER_I2C_BUS_ANTENNA_COUNT] = {
-  CAMERA_TARGET_FRAME_WIDTH / 2,
-  CAMERA_TARGET_FRAME_WIDTH / 2,
-  CAMERA_TARGET_FRAME_WIDTH / 8,
-  (CAMERA_TARGET_FRAME_WIDTH * 7) / 8,
-  CAMERA_TARGET_FRAME_WIDTH / 2,
-};
-
-static const int antenna_y[RECEIVER_I2C_BUS_ANTENNA_COUNT] = {
-  CAMERA_TARGET_FRAME_HEIGHT / 8,
-  (CAMERA_TARGET_FRAME_HEIGHT * 7) / 8,
-  CAMERA_TARGET_FRAME_HEIGHT / 2,
-  CAMERA_TARGET_FRAME_HEIGHT / 2,
-  CAMERA_TARGET_FRAME_HEIGHT / 2,
-};
 
 static void configure_optional_output_pin(int pin, int level)
 {
@@ -204,183 +175,12 @@ void camera_return_frame(camera_fb_t *frame)
   }
 }
 
-size_t camera_get_targets(camera_target_t *targets, size_t max_targets)
-{
-  if (targets == NULL || max_targets == 0) {
-    return 0;
-  }
-
-  if (camera_targets_lock != NULL) {
-    xSemaphoreTake(camera_targets_lock, portMAX_DELAY);
-  }
-
-  size_t count = camera_target_count;
-  if (count > max_targets) {
-    count = max_targets;
-  }
-
-  for (size_t i = 0; i < count; i++) {
-    targets[i] = camera_targets[i];
-  }
-
-  if (camera_targets_lock != NULL) {
-    xSemaphoreGive(camera_targets_lock);
-  }
-
-  return count;
-}
-
-static void publish_targets(const camera_target_t *targets, size_t count)
-{
-  if (camera_targets_lock != NULL) {
-    xSemaphoreTake(camera_targets_lock, portMAX_DELAY);
-  }
-
-  if (count > CAMERA_MAX_TARGETS) {
-    count = CAMERA_MAX_TARGETS;
-  }
-
-  for (size_t i = 0; i < count; i++) {
-    camera_targets[i] = targets[i];
-  }
-  camera_target_count = count;
-
-  if (camera_targets_lock != NULL) {
-    xSemaphoreGive(camera_targets_lock);
-  }
-}
-
-static int find_candidate_index(const target_candidate_t *candidates, size_t count, const uint8_t *mac)
-{
-  for (size_t i = 0; i < count; i++) {
-    if (memcmp(candidates[i].mac, mac, 6) == 0) {
-      return (int)i;
-    }
-  }
-
-  return -1;
-}
-
-static int rssi_to_weight(int rssi)
-{
-  int weight = 100 + rssi;
-  return (weight > 1) ? weight : 1;
-}
-
-static void clamp_target_to_frame(camera_target_t *target)
-{
-  if (target->x < 0) {
-    target->x = 0;
-  } else if (target->x > CAMERA_TARGET_FRAME_WIDTH) {
-    target->x = CAMERA_TARGET_FRAME_WIDTH;
-  }
-
-  if (target->y < 0) {
-    target->y = 0;
-  } else if (target->y > CAMERA_TARGET_FRAME_HEIGHT) {
-    target->y = CAMERA_TARGET_FRAME_HEIGHT;
-  }
-}
-
-static bool calculate_target_position(const target_candidate_t *candidate, camera_target_t *target)
-{
-  int weighted_x = 0;
-  int weighted_y = 0;
-  int total_weight = 0;
-
-  for (uint8_t antenna_id = 0; antenna_id < RECEIVER_I2C_BUS_ANTENNA_COUNT; antenna_id++) {
-    if (!candidate->seen[antenna_id]) {
-      continue;
-    }
-
-    int weight = rssi_to_weight(candidate->rssi[antenna_id]);
-    weighted_x += antenna_x[antenna_id] * weight;
-    weighted_y += antenna_y[antenna_id] * weight;
-    total_weight += weight;
-  }
-
-  if (total_weight == 0) {
-    return false;
-  }
-
-  memcpy(target->mac, candidate->mac, sizeof(target->mac));
-  target->x = weighted_x / total_weight;
-  target->y = weighted_y / total_weight;
-  target->rssi = candidate->best_rssi;
-  clamp_target_to_frame(target);
-
-  return true;
-}
-
-static void camera_task(void *arg)
-{
-  (void)arg;
-
-  while (1) {
-    receiver_i2c_bus_refresh_all();
-
-    target_candidate_t candidates[CAMERA_MAX_TARGETS] = {0};
-    size_t candidate_count = 0;
-    camera_target_t next_targets[CAMERA_MAX_TARGETS];
-    size_t next_target_count = 0;
-
-    for (uint8_t antenna_id = 0; antenna_id < RECEIVER_I2C_BUS_ANTENNA_COUNT; antenna_id++) {
-      uint8_t device_count = receiver_i2c_bus_get_device_count(antenna_id);
-      for (uint8_t device_index = 0; device_index < device_count; device_index++) {
-        const receiver_i2c_bus_device_t *device = receiver_i2c_bus_get_device(antenna_id, device_index);
-        if (device == NULL) {
-          continue;
-        }
-
-        int candidate_index = find_candidate_index(candidates, candidate_count, device->mac);
-        if (candidate_index < 0) {
-          if (candidate_count >= CAMERA_MAX_TARGETS) {
-            continue;
-          }
-
-          candidate_index = (int)candidate_count++;
-          memcpy(candidates[candidate_index].mac, device->mac, sizeof(candidates[candidate_index].mac));
-          candidates[candidate_index].best_rssi = device->rssi;
-        }
-
-        candidates[candidate_index].seen[antenna_id] = true;
-        candidates[candidate_index].rssi[antenna_id] = device->rssi;
-        if (device->rssi > candidates[candidate_index].best_rssi) {
-          candidates[candidate_index].best_rssi = device->rssi;
-        }
-      }
-    }
-
-    for (size_t i = 0; i < candidate_count && next_target_count < CAMERA_MAX_TARGETS; i++) {
-      camera_target_t target;
-      if (!calculate_target_position(&candidates[i], &target)) {
-        continue;
-      }
-
-      ESP_LOGI(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X -> Target Pixels X: %d | Y: %d",
-               target.mac[0], target.mac[1], target.mac[2],
-               target.mac[3], target.mac[4], target.mac[5],
-               target.x, target.y);
-
-      next_targets[next_target_count++] = target;
-    }
-
-    publish_targets(next_targets, next_target_count);
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-}
-
 void camera_init(void)
 {
-  ESP_LOGI(TAG, "Initializing receiver bus and OV5640 camera");
+  ESP_LOGI(TAG, "Initializing OV5640 camera");
 
   if (camera_sensor_init() != ESP_OK) {
     ESP_LOGE(TAG, "Camera sensor initialization failed");
-    return;
-  }
-
-  if (receiver_i2c_bus_init() != ESP_OK) {
-    ESP_LOGE(TAG, "Receiver I2C bus initialization failed");
     return;
   }
 
@@ -392,14 +192,5 @@ void camera_init(void)
     }
   }
 
-  if (camera_targets_lock == NULL) {
-    camera_targets_lock = xSemaphoreCreateMutex();
-    if (camera_targets_lock == NULL) {
-      ESP_LOGE(TAG, "Camera target mutex creation failed");
-      return;
-    }
-  }
-
-  xTaskCreate(camera_task, "camera_task", 8192, NULL, 5, NULL);
-  ESP_LOGI(TAG, "Camera task started");
+  ESP_LOGI(TAG, "Camera initialized");
 }

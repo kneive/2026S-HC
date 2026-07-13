@@ -10,6 +10,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
+#include "localization.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "WIFI_AP";
@@ -60,31 +61,41 @@ static esp_err_t root_handler(httpd_req_t *req)
       "<style>"
       "body{margin:0;background:#101418;color:#eef2f5;font-family:Arial,sans-serif;display:grid;place-items:center;min-height:100vh}"
       "main{width:min(100vw,960px);padding:16px;box-sizing:border-box}"
-      "h1{font-size:22px;font-weight:600;margin:0 0 12px}"
-      ".stage{position:relative;background:#000;line-height:0}"
-      "img{width:100%;height:auto;display:block}"
-      "canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}"
-      "p{color:#aab4be;font-size:14px}"
-      "</style>"
+	      "h1{font-size:22px;font-weight:600;margin:0 0 12px}"
+	      ".stage{position:relative;background:#000;line-height:0}"
+	      "img{width:100%;height:auto;display:block}"
+	      "canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}"
+	      ".legend{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;margin:10px 0 0;color:#aab4be;font-size:12px}"
+	      ".scale{height:10px;border-radius:5px;background:linear-gradient(90deg,#8a2be2,#00e5ff);box-shadow:0 0 0 1px rgba(255,255,255,.18) inset}"
+	      ".legend-title{grid-column:1/-1;color:#d7dee6;font-size:13px}"
+	      "p{color:#aab4be;font-size:14px}"
+	      "</style>"
       "</head>"
       "<body>"
       "<main>"
       "<h1>ESP32-S3 Camera Stream</h1>"
-      "<div class=\"stage\">"
-      "<img id=\"stream\" alt=\"camera stream\">"
-      "<canvas id=\"overlay\"></canvas>"
-      "</div>"
-      "<p id=\"status\">Targets: 0</p>"
-      "<p>Connect to WiFi SSID ESP32S3-Camera and open http://192.168.4.1/</p>"
-      "<script>"
-      "const img=document.getElementById('stream'),canvas=document.getElementById('overlay'),ctx=canvas.getContext('2d');"
-      "const status=document.getElementById('status');"
-      "let targets=[],fw=640,fh=480;"
-      "img.src='http://'+location.hostname+':81/stream';"
-      "function size(){const r=img.getBoundingClientRect();canvas.width=Math.max(1,Math.round(r.width));canvas.height=Math.max(1,Math.round(r.height));}"
-      "function mac(t){return t.mac||'';}"
-      "function draw(){size();ctx.clearRect(0,0,canvas.width,canvas.height);const sx=canvas.width/fw,sy=canvas.height/fh;ctx.lineWidth=2;ctx.font='12px Arial';ctx.textBaseline='top';for(const t of targets){const x=t.x*sx,y=t.y*sy;ctx.strokeStyle='#00e5ff';ctx.fillStyle='rgba(0,0,0,.55)';ctx.beginPath();ctx.arc(x,y,10,0,Math.PI*2);ctx.stroke();ctx.beginPath();ctx.moveTo(x-16,y);ctx.lineTo(x+16,y);ctx.moveTo(x,y-16);ctx.lineTo(x,y+16);ctx.stroke();const label=mac(t)+' '+t.rssi+'dBm';const w=ctx.measureText(label).width+8;ctx.fillRect(x+12,y+12,w,18);ctx.fillStyle='#fff';ctx.fillText(label,x+16,y+15);}}"
-      "async function poll(){try{const r=await fetch('/targets.json',{cache:'no-store'});const j=await r.json();targets=j.targets||[];fw=j.frame_width||640;fh=j.frame_height||480;status.textContent='Targets: '+targets.length;draw();}catch(e){status.textContent='Targets: fetch failed';}}"
+	      "<div class=\"stage\">"
+	      "<img id=\"stream\" alt=\"camera stream\">"
+	      "<canvas id=\"overlay\"></canvas>"
+	      "</div>"
+	      "<div class=\"legend\">"
+	      "<div class=\"legend-title\">RSSI color scale</div>"
+	      "<span>Weak -95 dBm</span><div class=\"scale\"></div><span>Strong -35 dBm</span>"
+	      "</div>"
+	      "<p id=\"status\">Targets: 0</p>"
+	      "<p>Connect to WiFi SSID ESP32S3-Camera and open http://192.168.4.1/</p>"
+	      "<script>"
+	      "const img=document.getElementById('stream'),canvas=document.getElementById('overlay'),ctx=canvas.getContext('2d');"
+	      "const status=document.getElementById('status');"
+	      "const weakRssi=-95,strongRssi=-35;"
+	      "let targets=[],fw=640,fh=480;"
+	      "img.src='http://'+location.hostname+':81/stream';"
+	      "function size(){const r=img.getBoundingClientRect();canvas.width=Math.max(1,Math.round(r.width));canvas.height=Math.max(1,Math.round(r.height));}"
+	      "function mac(t){return t.mac||'';}"
+	      "function clamp(v,min,max){return Math.max(min,Math.min(max,v));}"
+	      "function rssiColor(rssi){const t=clamp((rssi-weakRssi)/(strongRssi-weakRssi),0,1);const h=280+(188-280)*t;return 'hsl('+h+',100%,62%)';}"
+	      "function draw(){size();ctx.clearRect(0,0,canvas.width,canvas.height);const sx=canvas.width/fw,sy=canvas.height/fh;ctx.lineWidth=2;ctx.font='12px Arial';ctx.textBaseline='top';for(const t of targets){const x=t.x*sx,y=t.y*sy,c=rssiColor(t.rssi);ctx.strokeStyle=c;ctx.shadowColor=c;ctx.shadowBlur=8;ctx.beginPath();ctx.arc(x,y,10,0,Math.PI*2);ctx.stroke();ctx.beginPath();ctx.moveTo(x-16,y);ctx.lineTo(x+16,y);ctx.moveTo(x,y-16);ctx.lineTo(x,y+16);ctx.stroke();ctx.shadowBlur=0;const label=mac(t)+' '+t.rssi+'dBm';const w=ctx.measureText(label).width+8;ctx.fillStyle='rgba(0,0,0,.62)';ctx.fillRect(x+12,y+12,w,18);ctx.fillStyle=c;ctx.fillText(label,x+16,y+15);}}"
+	      "async function poll(){try{const r=await fetch('/targets.json',{cache:'no-store'});const j=await r.json();targets=j.targets||[];fw=j.frame_width||640;fh=j.frame_height||480;status.textContent='Targets: '+targets.length;draw();}catch(e){status.textContent='Targets: fetch failed';}}"
       "window.addEventListener('resize',draw);setInterval(poll,250);poll();"
       "</script>"
       "</main>"
@@ -97,12 +108,12 @@ static esp_err_t root_handler(httpd_req_t *req)
 
 static esp_err_t targets_handler(httpd_req_t *req)
 {
-  camera_target_t targets[CAMERA_MAX_TARGETS];
-  size_t count = camera_get_targets(targets, CAMERA_MAX_TARGETS);
+  localization_target_t targets[LOCALIZATION_MAX_TARGETS];
+  size_t count = localization_get_targets(targets, LOCALIZATION_MAX_TARGETS);
   char json[3072];
   int offset = snprintf(json, sizeof(json),
                         "{\"frame_width\":%d,\"frame_height\":%d,\"targets\":[",
-                        CAMERA_TARGET_FRAME_WIDTH, CAMERA_TARGET_FRAME_HEIGHT);
+                        LOCALIZATION_TARGET_FRAME_WIDTH, LOCALIZATION_TARGET_FRAME_HEIGHT);
 
   for (size_t i = 0; i < count && offset > 0 && offset < (int)sizeof(json); i++) {
     int written = snprintf(json + offset, sizeof(json) - offset,

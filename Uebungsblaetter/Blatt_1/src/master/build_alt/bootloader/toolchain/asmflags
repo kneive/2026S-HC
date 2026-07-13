@@ -1,0 +1,5 @@
+"-specs=/home/woodstock/projects/pi_coding/sensor_array/master/build_alt/bootloader/specs/picolibc.specs"
+-mlongcalls
+-fno-builtin-memcpy
+-fno-builtin-memset
+-fno-builtin-bzero

@@ -20,10 +20,11 @@ static const char *TAG = "RECEIVER_I2C_BUS";
 #define I2C_MASTER_TIMEOUT_MS 1000
 
 #define PER_DEVICE_BYTES (6 + 1 + 1 + RECEIVER_I2C_BUS_DEVICE_NAME_LEN)
-#define READ_BUFFER_SIZE (1 + (RECEIVER_I2C_BUS_MAX_TRACKED_DEVICES * PER_DEVICE_BYTES))
+#define PAGE_HEADER_BYTES 5
+#define READ_BUFFER_SIZE (PAGE_HEADER_BYTES + (RECEIVER_I2C_BUS_DEVICES_PER_PAGE * PER_DEVICE_BYTES))
 
 static receiver_i2c_bus_device_t receiver_database[RECEIVER_I2C_BUS_ANTENNA_COUNT][RECEIVER_I2C_BUS_MAX_TRACKED_DEVICES];
-static uint8_t device_counts_per_antenna[RECEIVER_I2C_BUS_ANTENNA_COUNT] = {0};
+static uint16_t device_counts_per_antenna[RECEIVER_I2C_BUS_ANTENNA_COUNT] = {0};
 static i2c_master_bus_handle_t bus_handle = NULL;
 static i2c_master_dev_handle_t mux_dev_handle = NULL;
 static i2c_master_dev_handle_t slave_dev_handle = NULL;
@@ -132,59 +133,96 @@ esp_err_t receiver_i2c_bus_refresh_antenna(uint8_t antenna_id)
     return probe_ret;
   }
 
-  uint8_t read_cmd = 0x00;
-  esp_err_t tx_ret = i2c_master_transmit(slave_dev_handle, &read_cmd, 1, I2C_MASTER_TIMEOUT_MS);
-  if (tx_ret != ESP_OK) {
-    ESP_LOGW(TAG, "Pre-read transmit failed for MUX channel %d: %s",
-             antenna_id, esp_err_to_name(tx_ret));
-  }
-
-  uint8_t read_buffer[READ_BUFFER_SIZE] = {0};
-  const int read_retries = 3;
-  esp_err_t ret = ESP_FAIL;
-  for (int attempt = 0; attempt < read_retries; attempt++) {
-    ret = i2c_master_receive(slave_dev_handle, read_buffer, READ_BUFFER_SIZE, I2C_MASTER_TIMEOUT_MS);
-    if (ret == ESP_OK) {
-      break;
-    }
-    ESP_LOGW(TAG, "Read attempt %d failed for antenna %d: %s",
-             attempt + 1, antenna_id, esp_err_to_name(ret));
-    vTaskDelay(pdMS_TO_TICKS(20));
-  }
-
-  if (ret != ESP_OK) {
-    device_counts_per_antenna[antenna_id] = 0;
-    memset(receiver_database[antenna_id], 0, sizeof(receiver_database[antenna_id]));
-    ESP_LOGW(TAG, "Failed to read from antenna %d: %s", antenna_id, esp_err_to_name(ret));
-    return ret;
-  }
-
-  uint8_t count = read_buffer[0];
-  device_counts_per_antenna[antenna_id] =
-      (count < RECEIVER_I2C_BUS_MAX_TRACKED_DEVICES) ? count : RECEIVER_I2C_BUS_MAX_TRACKED_DEVICES;
   memset(receiver_database[antenna_id], 0, sizeof(receiver_database[antenna_id]));
+  device_counts_per_antenna[antenna_id] = 0;
 
-  for (int i = 0; i < device_counts_per_antenna[antenna_id]; i++) {
-    int base = 1 + (i * PER_DEVICE_BYTES);
-    memcpy(receiver_database[antenna_id][i].mac, &read_buffer[base], 6);
+  uint8_t requested_page = 0;
+  uint8_t page_count = 1;
+  esp_err_t ret = ESP_OK;
 
-    uint8_t raw_rssi = read_buffer[base + 6];
-    receiver_database[antenna_id][i].rssi = -((int)raw_rssi);
-
-    uint8_t name_len = read_buffer[base + 7];
-    if (name_len > RECEIVER_I2C_BUS_DEVICE_NAME_LEN) {
-      name_len = RECEIVER_I2C_BUS_DEVICE_NAME_LEN;
+  do {
+    esp_err_t tx_ret = i2c_master_transmit(slave_dev_handle, &requested_page, 1, I2C_MASTER_TIMEOUT_MS);
+    if (tx_ret != ESP_OK) {
+      ESP_LOGW(TAG, "Page request transmit failed for MUX channel %d page %d: %s",
+               antenna_id, requested_page, esp_err_to_name(tx_ret));
+      device_counts_per_antenna[antenna_id] = 0;
+      memset(receiver_database[antenna_id], 0, sizeof(receiver_database[antenna_id]));
+      return tx_ret;
     }
 
-    memset(receiver_database[antenna_id][i].id, 0, RECEIVER_I2C_BUS_DEVICE_NAME_LEN + 1);
-    if (name_len > 0) {
-      memcpy(receiver_database[antenna_id][i].id, &read_buffer[base + 8], name_len);
+    uint8_t read_buffer[READ_BUFFER_SIZE] = {0};
+    const int read_retries = 3;
+    ret = ESP_FAIL;
+    for (int attempt = 0; attempt < read_retries; attempt++) {
+      ret = i2c_master_receive(slave_dev_handle, read_buffer, READ_BUFFER_SIZE, I2C_MASTER_TIMEOUT_MS);
+      if (ret == ESP_OK) {
+        break;
+      }
+      ESP_LOGW(TAG, "Read attempt %d failed for antenna %d page %d: %s",
+               attempt + 1, antenna_id, requested_page, esp_err_to_name(ret));
+      vTaskDelay(pdMS_TO_TICKS(20));
     }
-  }
+
+    if (ret != ESP_OK) {
+      device_counts_per_antenna[antenna_id] = 0;
+      memset(receiver_database[antenna_id], 0, sizeof(receiver_database[antenna_id]));
+      ESP_LOGW(TAG, "Failed to read from antenna %d page %d: %s",
+               antenna_id, requested_page, esp_err_to_name(ret));
+      return ret;
+    }
+
+    uint16_t total_count = (uint16_t)read_buffer[0] | ((uint16_t)read_buffer[1] << 8);
+    uint8_t response_page = read_buffer[2];
+    page_count = read_buffer[3];
+    uint8_t page_device_count = read_buffer[4];
+    if (page_device_count > RECEIVER_I2C_BUS_DEVICES_PER_PAGE) {
+      ESP_LOGW(TAG, "Slave returned too many devices for one page: %d", page_device_count);
+      page_device_count = RECEIVER_I2C_BUS_DEVICES_PER_PAGE;
+    }
+
+    if (page_count == 0) {
+      page_count = 1;
+    }
+
+    if (response_page != requested_page) {
+      ESP_LOGW(TAG, "Expected page %d but slave returned page %d", requested_page, response_page);
+    }
+
+    if (total_count > RECEIVER_I2C_BUS_MAX_TRACKED_DEVICES) {
+      total_count = RECEIVER_I2C_BUS_MAX_TRACKED_DEVICES;
+    }
+
+    for (uint8_t i = 0; i < page_device_count; i++) {
+      uint16_t device_index = ((uint16_t)requested_page * RECEIVER_I2C_BUS_DEVICES_PER_PAGE) + i;
+      if (device_index >= RECEIVER_I2C_BUS_MAX_TRACKED_DEVICES) {
+        break;
+      }
+
+      int base = PAGE_HEADER_BYTES + (i * PER_DEVICE_BYTES);
+      memcpy(receiver_database[antenna_id][device_index].mac, &read_buffer[base], 6);
+
+      uint8_t raw_rssi = read_buffer[base + 6];
+      receiver_database[antenna_id][device_index].rssi = -((int)raw_rssi);
+
+      uint8_t name_len = read_buffer[base + 7];
+      if (name_len > RECEIVER_I2C_BUS_DEVICE_NAME_LEN) {
+        name_len = RECEIVER_I2C_BUS_DEVICE_NAME_LEN;
+      }
+
+      memset(receiver_database[antenna_id][device_index].id, 0, RECEIVER_I2C_BUS_DEVICE_NAME_LEN + 1);
+      if (name_len > 0) {
+        memcpy(receiver_database[antenna_id][device_index].id, &read_buffer[base + 8], name_len);
+      }
+    }
+
+    device_counts_per_antenna[antenna_id] = total_count;
+    requested_page++;
+  } while (requested_page < page_count &&
+           requested_page * RECEIVER_I2C_BUS_DEVICES_PER_PAGE < RECEIVER_I2C_BUS_MAX_TRACKED_DEVICES);
 
   ESP_LOGI(TAG, "Antenna %d: %d device(s)", antenna_id, device_counts_per_antenna[antenna_id]);
-  for (int i = 0; i < device_counts_per_antenna[antenna_id]; i++) {
-    ESP_LOGI(TAG, "Antenna %d Device %d: %02X:%02X:%02X:%02X:%02X:%02X RSSI: %d Name: %s",
+  for (uint16_t i = 0; i < device_counts_per_antenna[antenna_id]; i++) {
+    ESP_LOGD(TAG, "Antenna %d Device %d: %02X:%02X:%02X:%02X:%02X:%02X RSSI: %d Name: %s",
              antenna_id, i,
              receiver_database[antenna_id][i].mac[0], receiver_database[antenna_id][i].mac[1],
              receiver_database[antenna_id][i].mac[2], receiver_database[antenna_id][i].mac[3],
@@ -203,7 +241,7 @@ void receiver_i2c_bus_refresh_all(void)
   }
 }
 
-uint8_t receiver_i2c_bus_get_device_count(uint8_t antenna_id)
+uint16_t receiver_i2c_bus_get_device_count(uint8_t antenna_id)
 {
   if (antenna_id >= RECEIVER_I2C_BUS_ANTENNA_COUNT) {
     return 0;
@@ -212,7 +250,7 @@ uint8_t receiver_i2c_bus_get_device_count(uint8_t antenna_id)
   return device_counts_per_antenna[antenna_id];
 }
 
-const receiver_i2c_bus_device_t *receiver_i2c_bus_get_device(uint8_t antenna_id, uint8_t device_index)
+const receiver_i2c_bus_device_t *receiver_i2c_bus_get_device(uint8_t antenna_id, uint16_t device_index)
 {
   if (antenna_id >= RECEIVER_I2C_BUS_ANTENNA_COUNT ||
       device_index >= device_counts_per_antenna[antenna_id]) {
@@ -228,7 +266,7 @@ int receiver_i2c_bus_find_rssi_for_mac(uint8_t antenna_id, const uint8_t *target
     return -100;
   }
 
-  for (int i = 0; i < device_counts_per_antenna[antenna_id]; i++) {
+  for (uint16_t i = 0; i < device_counts_per_antenna[antenna_id]; i++) {
     if (memcmp(receiver_database[antenna_id][i].mac, target_mac, 6) == 0) {
       return receiver_database[antenna_id][i].rssi;
     }
