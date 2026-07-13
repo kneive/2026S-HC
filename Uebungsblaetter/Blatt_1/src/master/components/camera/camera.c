@@ -1,272 +1,405 @@
+#include "camera.h"
+
+#include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include "driver/gpio.h"
+#include "driver/i2c_types.h"
+#include "esp_camera.h"
 #include "esp_check.h"
-#include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
+#include "receiver_i2c_bus.h"
 
 static const char *TAG = "CAMERA";
 
-#define MUX_I2C_ADDRESS 0x70
-#define SLAVE_I2C_ADDRESS 0x12 // same I2C address on every MUX channel
-#define MAX_TRACKED_DEVICES 5
-#define DEVICE_NAME_LEN 32
-#define I2C_MASTER_SCL_IO 9
-#define I2C_MASTER_SDA_IO 8
-#define I2C_MASTER_FREQ_HZ 100000
-#define I2C_MASTER_TIMEOUT_MS 1000
+// Default ESP32-S3 OV5640 camera wiring used by common S3 camera boards.
+// Adjust these if your board routes the camera differently.
+#define CAMERA_PIN_PWDN -1
+#define CAMERA_PIN_RESET -1
+#define CAMERA_PIN_XCLK 15
+#define CAMERA_PIN_SIOD 4
+#define CAMERA_PIN_SIOC 5
+#define CAMERA_PIN_D7 16
+#define CAMERA_PIN_D6 17
+#define CAMERA_PIN_D5 18
+#define CAMERA_PIN_D4 12
+#define CAMERA_PIN_D3 10
+#define CAMERA_PIN_D2 8
+#define CAMERA_PIN_D1 9
+#define CAMERA_PIN_D0 11
+#define CAMERA_PIN_VSYNC 6
+#define CAMERA_PIN_HREF 7
+#define CAMERA_PIN_PCLK 13
 
-struct AntennaData {
+#define CAMERA_SCCB_I2C_PORT I2C_NUM_1
+#define CAMERA_XCLK_FREQ_HZ 20000000
+#define CAMERA_JPEG_QUALITY 12
+#define CAMERA_FB_COUNT 1
+#define CAMERA_FLIP_VERTICAL 1
+
+static bool camera_driver_initialized = false;
+static SemaphoreHandle_t camera_frame_lock = NULL;
+static SemaphoreHandle_t camera_targets_lock = NULL;
+static camera_target_t camera_targets[CAMERA_MAX_TARGETS];
+static size_t camera_target_count = 0;
+
+typedef struct {
   uint8_t mac[6];
-  int rssi;
-  char id[DEVICE_NAME_LEN + 1];
+  int rssi[RECEIVER_I2C_BUS_ANTENNA_COUNT];
+  bool seen[RECEIVER_I2C_BUS_ANTENNA_COUNT];
+  int best_rssi;
+} target_candidate_t;
+
+static const int antenna_x[RECEIVER_I2C_BUS_ANTENNA_COUNT] = {
+  CAMERA_TARGET_FRAME_WIDTH / 2,
+  CAMERA_TARGET_FRAME_WIDTH / 2,
+  CAMERA_TARGET_FRAME_WIDTH / 8,
+  (CAMERA_TARGET_FRAME_WIDTH * 7) / 8,
+  CAMERA_TARGET_FRAME_WIDTH / 2,
 };
 
-// 2D matrix to hold data
-struct AntennaData MasterDatabase[6][MAX_TRACKED_DEVICES];
-uint8_t device_counts_per_antenna[6] = {0, 0, 0, 0, 0, 0};
-static i2c_master_bus_handle_t bus_handle = NULL;
-static i2c_master_dev_handle_t mux_dev_handle = NULL;
-static i2c_master_dev_handle_t slave_dev_handle = NULL;
+static const int antenna_y[RECEIVER_I2C_BUS_ANTENNA_COUNT] = {
+  CAMERA_TARGET_FRAME_HEIGHT / 8,
+  (CAMERA_TARGET_FRAME_HEIGHT * 7) / 8,
+  CAMERA_TARGET_FRAME_HEIGHT / 2,
+  CAMERA_TARGET_FRAME_HEIGHT / 2,
+  CAMERA_TARGET_FRAME_HEIGHT / 2,
+};
 
-// I2C initialization
-esp_err_t i2c_master_init(void) {
-  ESP_LOGI(TAG, "I2C pins: SDA=%d, SCL=%d", I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
-
-  if (!GPIO_IS_VALID_GPIO(I2C_MASTER_SDA_IO) || !GPIO_IS_VALID_GPIO(I2C_MASTER_SCL_IO)) {
-    ESP_LOGE(TAG, "Invalid SDA/SCL pin number: SDA=%d, SCL=%d", I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
-    return ESP_ERR_INVALID_ARG;
+static void configure_optional_output_pin(int pin, int level)
+{
+  if (pin < 0) {
+    return;
   }
 
-  i2c_master_bus_config_t i2c_bus_config = {
-    .clk_source = I2C_CLK_SRC_DEFAULT,
-    .i2c_port = I2C_NUM_0,
-    .scl_io_num = I2C_MASTER_SCL_IO,
-    .sda_io_num = I2C_MASTER_SDA_IO,
-    .glitch_ignore_cnt = 7,
-    .flags.enable_internal_pullup = true,
+  gpio_config_t io_conf = {
+    .pin_bit_mask = 1ULL << pin,
+    .mode = GPIO_MODE_OUTPUT,
+    .pull_up_en = GPIO_PULLUP_DISABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type = GPIO_INTR_DISABLE,
   };
+  ESP_ERROR_CHECK(gpio_config(&io_conf));
+  ESP_ERROR_CHECK(gpio_set_level(pin, level));
+}
 
-  ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_bus_config, &bus_handle), TAG, "I2C bus creation failed");
+esp_err_t camera_power_on(void)
+{
+  configure_optional_output_pin(CAMERA_PIN_PWDN, 0);
+  configure_optional_output_pin(CAMERA_PIN_RESET, 1);
+  vTaskDelay(pdMS_TO_TICKS(10));
 
-  i2c_device_config_t mux_dev_config = {
-    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-    .device_address = MUX_I2C_ADDRESS,
-    .scl_speed_hz = I2C_MASTER_FREQ_HZ,
-  };
+  if (CAMERA_PIN_RESET >= 0) {
+    ESP_RETURN_ON_ERROR(gpio_set_level(CAMERA_PIN_RESET, 0), TAG, "Camera reset assert failed");
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_RETURN_ON_ERROR(gpio_set_level(CAMERA_PIN_RESET, 1), TAG, "Camera reset release failed");
+  }
 
-  ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus_handle, &mux_dev_config, &mux_dev_handle), 
-                      TAG, "MUX device creation failed");
-
-  i2c_device_config_t slave_dev_config = {
-    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-    .device_address = SLAVE_I2C_ADDRESS,
-    .scl_speed_hz = I2C_MASTER_FREQ_HZ,
-  };
-
-  ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus_handle, &slave_dev_config, &slave_dev_handle), 
-                      TAG, "Slave device creation failed");
-
-  ESP_LOGI(TAG, "I2C Master initialized (SCL: GPIO%d, SDA: GPIO%d)", 
-           I2C_MASTER_SCL_IO, I2C_MASTER_SDA_IO);
-  
+  vTaskDelay(pdMS_TO_TICKS(30));
   return ESP_OK;
 }
 
-esp_err_t select_mux_channel(uint8_t channel) {
-  if (channel > 7) {
-    ESP_LOGW(TAG, "Invalid MUX channel: %d", channel);
-    return ESP_ERR_INVALID_ARG;
+esp_err_t camera_power_off(void)
+{
+  if (camera_driver_initialized) {
+    ESP_RETURN_ON_ERROR(esp_camera_deinit(), TAG, "Camera deinit failed");
+    camera_driver_initialized = false;
   }
 
-  uint8_t mux_value = 1 << channel;
-  esp_err_t ret = i2c_master_transmit(mux_dev_handle, &mux_value, 1, I2C_MASTER_TIMEOUT_MS);
-
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to select MUX channel %d: %s", channel, esp_err_to_name(ret));
-    return ret;
-  }
-
-  ESP_LOGD(TAG, "MUX channel %d selected", channel);
+  configure_optional_output_pin(CAMERA_PIN_PWDN, 1);
+  configure_optional_output_pin(CAMERA_PIN_RESET, 0);
   return ESP_OK;
 }
 
-void parse_antenna_table(uint8_t antenna_id) {
-  if(antenna_id >= 6) {
-    ESP_LOGW(TAG, "Invalid antenna ID: %d", antenna_id);
-    return;
+static esp_err_t camera_sensor_init(void)
+{
+  ESP_RETURN_ON_ERROR(camera_power_on(), TAG, "Camera power-on failed");
+
+  camera_config_t config = {
+    .pin_pwdn = CAMERA_PIN_PWDN,
+    .pin_reset = CAMERA_PIN_RESET,
+    .pin_xclk = CAMERA_PIN_XCLK,
+    .pin_sccb_sda = CAMERA_PIN_SIOD,
+    .pin_sccb_scl = CAMERA_PIN_SIOC,
+    .sccb_i2c_port = CAMERA_SCCB_I2C_PORT,
+    .pin_d7 = CAMERA_PIN_D7,
+    .pin_d6 = CAMERA_PIN_D6,
+    .pin_d5 = CAMERA_PIN_D5,
+    .pin_d4 = CAMERA_PIN_D4,
+    .pin_d3 = CAMERA_PIN_D3,
+    .pin_d2 = CAMERA_PIN_D2,
+    .pin_d1 = CAMERA_PIN_D1,
+    .pin_d0 = CAMERA_PIN_D0,
+    .pin_vsync = CAMERA_PIN_VSYNC,
+    .pin_href = CAMERA_PIN_HREF,
+    .pin_pclk = CAMERA_PIN_PCLK,
+    .xclk_freq_hz = CAMERA_XCLK_FREQ_HZ,
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+    .pixel_format = PIXFORMAT_JPEG,
+    .frame_size = FRAMESIZE_VGA,
+    .jpeg_quality = CAMERA_JPEG_QUALITY,
+    .fb_count = CAMERA_FB_COUNT,
+    .fb_location = CAMERA_FB_IN_DRAM,
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+  };
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "OV5640 camera init failed: %s", esp_err_to_name(err));
+    (void)camera_power_off();
+    return err;
   }
 
-  // Try selecting MUX channel with retries
-  const int select_retries = 3;
-  esp_err_t sel_ret = ESP_FAIL;
-  for (int attempt = 0; attempt < select_retries; attempt++) {
-    sel_ret = select_mux_channel(antenna_id);
-    if (sel_ret == ESP_OK) break;
-    ESP_LOGW(TAG, "select_mux_channel attempt %d failed for antenna %d: %s", attempt + 1, antenna_id, esp_err_to_name(sel_ret));
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-  if (sel_ret != ESP_OK) {
-    device_counts_per_antenna[antenna_id] = 0;
-    ESP_LOGW(TAG, "Skipping antenna %d due to MUX select failure", antenna_id);
-    return;
+  camera_driver_initialized = true;
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == NULL) {
+    ESP_LOGW(TAG, "Camera initialized, but sensor handle is unavailable");
+    return ESP_OK;
   }
 
-  // Allow more time for the MUX to switch physically
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  // Debug: selecting MUX channel and querying slave
-  // ESP_LOGI(TAG, "Selecting MUX channel %d and querying slave at 0x%02X", antenna_id, SLAVE_I2C_ADDRESS);
-
-  // Probe the slave on this MUX channel before attempting the full read
-  esp_err_t probe_ret = i2c_master_probe(bus_handle, SLAVE_I2C_ADDRESS, I2C_MASTER_TIMEOUT_MS);
-  if (probe_ret != ESP_OK) {
-    device_counts_per_antenna[antenna_id] = 0;
-    // Probe failure — comment out verbose warning to reduce log noise
-    // ESP_LOGW(TAG, "No slave at 0x%02X on MUX channel %d (probe: %s)", SLAVE_I2C_ADDRESS, antenna_id, esp_err_to_name(probe_ret));
-    return;
+  ESP_LOGI(TAG, "Camera sensor PID: 0x%04X", sensor->id.PID);
+  if (sensor->set_framesize != NULL) {
+    sensor->set_framesize(sensor, FRAMESIZE_VGA);
+  }
+  if (sensor->set_vflip != NULL) {
+    sensor->set_vflip(sensor, CAMERA_FLIP_VERTICAL);
   }
 
-  // Perform a short write before the read — slave expects master-write then master-read
-  uint8_t read_cmd = 0x00;
-  esp_err_t tx_ret = i2c_master_transmit(slave_dev_handle, &read_cmd, 1, I2C_MASTER_TIMEOUT_MS);
-  if (tx_ret != ESP_OK) {
-    ESP_LOGW(TAG, "Pre-read transmit failed for MUX channel %d: %s", antenna_id, esp_err_to_name(tx_ret));
-    // continue — read retries may still succeed
+  ESP_LOGI(TAG, "OV5640 camera initialized at VGA JPEG");
+  return ESP_OK;
+}
+
+camera_fb_t *camera_capture_frame(void)
+{
+  if (!camera_driver_initialized) {
+    ESP_LOGW(TAG, "Frame requested before camera driver initialization");
+    return NULL;
   }
 
-  // Request max possible buffer size (1 byte count + MAX_TRACKED_DEVICES * per-device bytes)
-  #define PER_DEVICE_BYTES (6 + 1 + 1 + DEVICE_NAME_LEN)
-  #define READ_BUFFER_SIZE (1 + (MAX_TRACKED_DEVICES * PER_DEVICE_BYTES))
-  uint8_t read_buffer[READ_BUFFER_SIZE];
-  // Attempt the read with a few retries to tolerate transient NAKs
-  const int read_retries = 3;
-  esp_err_t ret = ESP_FAIL;
-  for (int attempt = 0; attempt < read_retries; attempt++) {
-    ret = i2c_master_receive(slave_dev_handle, read_buffer, READ_BUFFER_SIZE, I2C_MASTER_TIMEOUT_MS);
-    if (ret == ESP_OK) break;
-    ESP_LOGW(TAG, "Read attempt %d failed for antenna %d: %s", attempt + 1, antenna_id, esp_err_to_name(ret));
-    vTaskDelay(pdMS_TO_TICKS(20));
+  if (camera_frame_lock != NULL) {
+    xSemaphoreTake(camera_frame_lock, portMAX_DELAY);
   }
 
-  if(ret == ESP_OK) {
-    uint8_t count = read_buffer[0];
-    device_counts_per_antenna[antenna_id] = (count < MAX_TRACKED_DEVICES) ? count : MAX_TRACKED_DEVICES;
+  camera_fb_t *frame = esp_camera_fb_get();
+  if (frame == NULL && camera_frame_lock != NULL) {
+    xSemaphoreGive(camera_frame_lock);
+  }
 
-    for(int i = 0; i < device_counts_per_antenna[antenna_id]; i++) {
-      int base = 1 + (i * PER_DEVICE_BYTES);
-      // Copy MAC address (6 bytes)
-      memcpy(MasterDatabase[antenna_id][i].mac, &read_buffer[base], 6);
+  return frame;
+}
 
-      // Copy RSSI (1 byte, convert to negative)
-      uint8_t raw_rssi = read_buffer[base + 6];
-      MasterDatabase[antenna_id][i].rssi = -((int)raw_rssi);
+void camera_return_frame(camera_fb_t *frame)
+{
+  if (frame != NULL) {
+    esp_camera_fb_return(frame);
+  }
 
-      // Copy device name using length prefix (NAMELEN at base+7)
-      uint8_t name_len = read_buffer[base + 7];
-      if (name_len > DEVICE_NAME_LEN) name_len = DEVICE_NAME_LEN;
-      memset(MasterDatabase[antenna_id][i].id, 0, DEVICE_NAME_LEN + 1);
-      if (name_len) memcpy(MasterDatabase[antenna_id][i].id, &read_buffer[base + 8], name_len);
-    }
-
-    // Output received data at INFO level so user can see what was read (includes device name)
-    ESP_LOGI(TAG, "Antenna %d: %d device(s)", antenna_id, device_counts_per_antenna[antenna_id]);
-    for (int i = 0; i < device_counts_per_antenna[antenna_id]; i++) {
-      ESP_LOGI(TAG, "Antenna %d Device %d: %02X:%02X:%02X:%02X:%02X:%02X RSSI: %d Name: %s",
-               antenna_id, i,
-               MasterDatabase[antenna_id][i].mac[0], MasterDatabase[antenna_id][i].mac[1],
-               MasterDatabase[antenna_id][i].mac[2], MasterDatabase[antenna_id][i].mac[3],
-               MasterDatabase[antenna_id][i].mac[4], MasterDatabase[antenna_id][i].mac[5],
-               MasterDatabase[antenna_id][i].rssi,
-               MasterDatabase[antenna_id][i].id[0] ? MasterDatabase[antenna_id][i].id : "<no-name>");
-    }
-    #undef PER_DEVICE_BYTES
-    #undef READ_BUFFER_SIZE
-  } else {
-    device_counts_per_antenna[antenna_id] = 0;  // Antenna offline
-    ESP_LOGW(TAG, "Failed to read from antenna %d: %s", antenna_id, esp_err_to_name(ret));
+  if (camera_frame_lock != NULL) {
+    xSemaphoreGive(camera_frame_lock);
   }
 }
 
-// Helper - lookup what a specific antenna measured for a specific MAC Address
-int find_rssi_for_mac(uint8_t antenna_id, uint8_t* target_mac) {
-  if(antenna_id >= 6) return -100;
-  
-  for(int i = 0; i < device_counts_per_antenna[antenna_id]; i++) {
-    if(memcmp(MasterDatabase[antenna_id][i].mac, target_mac, 6) == 0) {
-      return MasterDatabase[antenna_id][i].rssi;
-    }
+size_t camera_get_targets(camera_target_t *targets, size_t max_targets)
+{
+  if (targets == NULL || max_targets == 0) {
+    return 0;
   }
-  return -100;  // Not seen by this antenna
+
+  if (camera_targets_lock != NULL) {
+    xSemaphoreTake(camera_targets_lock, portMAX_DELAY);
+  }
+
+  size_t count = camera_target_count;
+  if (count > max_targets) {
+    count = max_targets;
+  }
+
+  for (size_t i = 0; i < count; i++) {
+    targets[i] = camera_targets[i];
+  }
+
+  if (camera_targets_lock != NULL) {
+    xSemaphoreGive(camera_targets_lock);
+  }
+
+  return count;
 }
 
-// Main camera processing task
-void camera_task(void *arg) {
-  while(1) {
-    // 1. Grab databases from all 6 antenna channels
-    for(uint8_t i = 0; i < 6; i++) {
-      parse_antenna_table(i);
+static void publish_targets(const camera_target_t *targets, size_t count)
+{
+  if (camera_targets_lock != NULL) {
+    xSemaphoreTake(camera_targets_lock, portMAX_DELAY);
+  }
+
+  if (count > CAMERA_MAX_TARGETS) {
+    count = CAMERA_MAX_TARGETS;
+  }
+
+  for (size_t i = 0; i < count; i++) {
+    camera_targets[i] = targets[i];
+  }
+  camera_target_count = count;
+
+  if (camera_targets_lock != NULL) {
+    xSemaphoreGive(camera_targets_lock);
+  }
+}
+
+static int find_candidate_index(const target_candidate_t *candidates, size_t count, const uint8_t *mac)
+{
+  for (size_t i = 0; i < count; i++) {
+    if (memcmp(candidates[i].mac, mac, 6) == 0) {
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+
+static int rssi_to_weight(int rssi)
+{
+  int weight = 100 + rssi;
+  return (weight > 1) ? weight : 1;
+}
+
+static void clamp_target_to_frame(camera_target_t *target)
+{
+  if (target->x < 0) {
+    target->x = 0;
+  } else if (target->x > CAMERA_TARGET_FRAME_WIDTH) {
+    target->x = CAMERA_TARGET_FRAME_WIDTH;
+  }
+
+  if (target->y < 0) {
+    target->y = 0;
+  } else if (target->y > CAMERA_TARGET_FRAME_HEIGHT) {
+    target->y = CAMERA_TARGET_FRAME_HEIGHT;
+  }
+}
+
+static bool calculate_target_position(const target_candidate_t *candidate, camera_target_t *target)
+{
+  int weighted_x = 0;
+  int weighted_y = 0;
+  int total_weight = 0;
+
+  for (uint8_t antenna_id = 0; antenna_id < RECEIVER_I2C_BUS_ANTENNA_COUNT; antenna_id++) {
+    if (!candidate->seen[antenna_id]) {
+      continue;
     }
 
-    // 2. Use Center Antenna (ID 4) as baseline loop list
-    for(int i = 0; i < device_counts_per_antenna[4]; i++) {
-      uint8_t* current_mac = MasterDatabase[4][i].mac;
-      int rssi_center = MasterDatabase[4][i].rssi;
+    int weight = rssi_to_weight(candidate->rssi[antenna_id]);
+    weighted_x += antenna_x[antenna_id] * weight;
+    weighted_y += antenna_y[antenna_id] * weight;
+    total_weight += weight;
+  }
 
-      // Find matching signals on outer quadrants
-      int rssi_top = find_rssi_for_mac(0, current_mac);
-      int rssi_bottom = find_rssi_for_mac(1, current_mac);
-      int rssi_left = find_rssi_for_mac(2, current_mac);
-      int rssi_right = find_rssi_for_mac(3, current_mac);
+  if (total_weight == 0) {
+    return false;
+  }
 
-      // Only triangulate if all quadrants caught a piece of the transmission
-      if(rssi_top > -95 && rssi_bottom > -95 && rssi_left > -95 && rssi_right > -95) {
-        float dev_x = (float)(rssi_right - rssi_left) / (float)abs(rssi_center);
-        float dev_y = (float)(rssi_top - rssi_bottom) / (float)abs(rssi_center);
-        int pixel_x = (320 + (int)(dev_x * 450.0) < 0) ? 0 : ((320 + (int)(dev_x * 450.0) > 640) ? 640 : 320 + (int)(dev_x * 450.0));
-        int pixel_y = (240 - (int)(dev_y * 450.0) < 0) ? 0 : ((240 - (int)(dev_y * 450.0) > 480) ? 480 : 240 - (int)(dev_y * 450.0));
+  memcpy(target->mac, candidate->mac, sizeof(target->mac));
+  target->x = weighted_x / total_weight;
+  target->y = weighted_y / total_weight;
+  target->rssi = candidate->best_rssi;
+  clamp_target_to_frame(target);
 
-        // Print coordinate calculations for every active device found
-        ESP_LOGI(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X -> Target Pixels X: %d | Y: %d",
-          current_mac[0], current_mac[1], current_mac[2],
-          current_mac[3], current_mac[4], current_mac[5], pixel_x, pixel_y);
+  return true;
+}
 
-        // Video Code comes here
+static void camera_task(void *arg)
+{
+  (void)arg;
+
+  while (1) {
+    receiver_i2c_bus_refresh_all();
+
+    target_candidate_t candidates[CAMERA_MAX_TARGETS] = {0};
+    size_t candidate_count = 0;
+    camera_target_t next_targets[CAMERA_MAX_TARGETS];
+    size_t next_target_count = 0;
+
+    for (uint8_t antenna_id = 0; antenna_id < RECEIVER_I2C_BUS_ANTENNA_COUNT; antenna_id++) {
+      uint8_t device_count = receiver_i2c_bus_get_device_count(antenna_id);
+      for (uint8_t device_index = 0; device_index < device_count; device_index++) {
+        const receiver_i2c_bus_device_t *device = receiver_i2c_bus_get_device(antenna_id, device_index);
+        if (device == NULL) {
+          continue;
+        }
+
+        int candidate_index = find_candidate_index(candidates, candidate_count, device->mac);
+        if (candidate_index < 0) {
+          if (candidate_count >= CAMERA_MAX_TARGETS) {
+            continue;
+          }
+
+          candidate_index = (int)candidate_count++;
+          memcpy(candidates[candidate_index].mac, device->mac, sizeof(candidates[candidate_index].mac));
+          candidates[candidate_index].best_rssi = device->rssi;
+        }
+
+        candidates[candidate_index].seen[antenna_id] = true;
+        candidates[candidate_index].rssi[antenna_id] = device->rssi;
+        if (device->rssi > candidates[candidate_index].best_rssi) {
+          candidates[candidate_index].best_rssi = device->rssi;
+        }
       }
     }
 
+    for (size_t i = 0; i < candidate_count && next_target_count < CAMERA_MAX_TARGETS; i++) {
+      camera_target_t target;
+      if (!calculate_target_position(&candidates[i], &target)) {
+        continue;
+      }
+
+      ESP_LOGI(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X -> Target Pixels X: %d | Y: %d",
+               target.mac[0], target.mac[1], target.mac[2],
+               target.mac[3], target.mac[4], target.mac[5],
+               target.x, target.y);
+
+      next_targets[next_target_count++] = target;
+    }
+
+    publish_targets(next_targets, next_target_count);
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
-// I2C bus scanner: probes addresses and logs any responding devices
-static void i2c_scan_bus(void)
+void camera_init(void)
 {
-  // Scanner debug output commented out to reduce log noise. Enable if needed for troubleshooting.
-  // ESP_LOGI(TAG, "Starting I2C scan on bus...");
-  // for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
-  //   esp_err_t ret = i2c_master_probe(bus_handle, addr, I2C_MASTER_TIMEOUT_MS);
-  //   if (ret == ESP_OK) {
-  //     ESP_LOGI(TAG, "I2C device found at 0x%02X", addr);
-  //   }
-  // }
-  // ESP_LOGI(TAG, "I2C scan complete");
-}
+  ESP_LOGI(TAG, "Initializing receiver bus and OV5640 camera");
 
-// Initialization function
-void camera_init(void) {
-  ESP_LOGI(TAG, "Initializing camera module...");
-  
-  if(i2c_master_init() != ESP_OK) {
-    ESP_LOGE(TAG, "I2C Master initialization failed");
+  if (camera_sensor_init() != ESP_OK) {
+    ESP_LOGE(TAG, "Camera sensor initialization failed");
     return;
   }
-  // Run a brief I2C scan to list any devices on the bus (helps debug wiring)
-  i2c_scan_bus();
 
-  // Create camera processing task
-  xTaskCreate(camera_task, "camera_task", 4096, NULL, 5, NULL);
+  if (receiver_i2c_bus_init() != ESP_OK) {
+    ESP_LOGE(TAG, "Receiver I2C bus initialization failed");
+    return;
+  }
+
+  if (camera_frame_lock == NULL) {
+    camera_frame_lock = xSemaphoreCreateMutex();
+    if (camera_frame_lock == NULL) {
+      ESP_LOGE(TAG, "Camera frame mutex creation failed");
+      return;
+    }
+  }
+
+  if (camera_targets_lock == NULL) {
+    camera_targets_lock = xSemaphoreCreateMutex();
+    if (camera_targets_lock == NULL) {
+      ESP_LOGE(TAG, "Camera target mutex creation failed");
+      return;
+    }
+  }
+
+  xTaskCreate(camera_task, "camera_task", 8192, NULL, 5, NULL);
   ESP_LOGI(TAG, "Camera task started");
 }
