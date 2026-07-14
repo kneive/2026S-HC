@@ -19,6 +19,7 @@
 # Build artifacts and directories
 **/build/
 build/
+build_alt/
 *.o
 *.a
 *.out
@@ -76,4 +77,3 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
-// comment
